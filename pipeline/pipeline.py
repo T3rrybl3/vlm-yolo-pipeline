@@ -44,7 +44,7 @@ Return ONLY JSON in this format:
 }}
 No extra text, no markdown.
 """
-
+        prompt += "\nDo NOT describe any additional people not listed."  # reduce hallucination
         vlm_output_obj = self.vlm.describe_structured(image_path, prompt)
 
         vlm_output = vlm_output_obj.people
