@@ -1,0 +1,17 @@
+# HTTP client for VLM API
+httpx>=0.24.0
+
+# Pydantic for structured JSON validation
+pydantic>=2.3.0
+
+# Ultralytics YOLOv8
+ultralytics>=8.1.0
+
+# OpenCV for image and video display
+opencv-python>=4.8.0.76
+
+# PIL/Pillow for image handling
+Pillow>=10.0.0
+
+# Optional: numpy if not already included
+numpy>=1.26.0
