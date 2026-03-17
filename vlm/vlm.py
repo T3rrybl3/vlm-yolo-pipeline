@@ -4,11 +4,14 @@ import json
 from pydantic import BaseModel
 
 
-class SceneDescription(BaseModel):  # used as a check for datatype
-    people_count: int
-    objects: list[str]
-    scene_summary: str
-    confidence: str
+class PersonDescription(BaseModel):  # used as a check for datatype
+    id: int
+    action: str
+    attributes: str
+
+
+class PeopleDescription(BaseModel):
+    people: list[PersonDescription]
 
 
 class VLMClient:
@@ -46,17 +49,9 @@ class VLMClient:
 
         return resp.json()["choices"][0]["message"]["content"]
 
-    def describe_structured(self, path: str) -> SceneDescription:  # work in progress
-        prompt = """Return ONLY JSON:
-{
-  "people_count": int,
-  "objects": [strings],
-  "scene_summary": "one sentence",
-  "confidence": "high|medium|low"
-}
-"""
+    def describe_structured(self, path: str, prompt: str) -> PeopleDescription:
 
         raw = self.describe(path, prompt)
 
         clean = raw.strip().replace("```json", "").replace("```", "")
-        return SceneDescription(**json.loads(clean))
+        return PeopleDescription(**json.loads(clean))

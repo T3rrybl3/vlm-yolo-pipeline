@@ -16,7 +16,8 @@ class YOLODetector:
                     "class": self.model.names[int(box.cls[0])],
                     "confidence": float(box.conf[0]),
                     # convert from tensor to python values
-                    "bbox": list(map(float, box.xyxy[0]))
+                    "bbox": list(map(float, box.xyxy[0])),
+                    "id": None  # placeholder, will be set in pipeline
                 })
         print(f"Passed YOLO")
         return detections  # returns a list of 2 dicts

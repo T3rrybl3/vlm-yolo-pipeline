@@ -9,4 +9,5 @@ if __name__ == "__main__":
     pipeline = PerceptionPipeline()
     result = pipeline.run(sys.argv[1])
 
-    print(result)
+    print(
+        f'Detections by YOLO: {result["detections"]} \n Results by VLM: {result["people"]}')
