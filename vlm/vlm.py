@@ -1,6 +1,7 @@
 import base64
 import httpx
 import json
+import os
 from pydantic import BaseModel
 
 
@@ -15,9 +16,11 @@ class PeopleDescription(BaseModel):
 
 
 class VLMClient:
-    def __init__(self, model="qwen2.5vl:7b"):
-        self.model = model
-        self.url = "http://localhost:11434/v1/chat/completions"
+    def __init__(self, model=None):
+        # 3B fits much better on a 6GB GPU, 7B was falling back to CPU on this machine
+        self.model = model or os.getenv("VLM_MODEL", "qwen2.5vl:3b")
+        self.url = os.getenv("VLM_URL", "http://localhost:11434/v1/chat/completions")
+        self.timeout_sec = int(os.getenv("VLM_TIMEOUT_SEC", "120"))
 
     def _encode_image(self, path: str):  # convert image to format suitable for vlm
         with open(path, "rb") as f:
@@ -48,7 +51,7 @@ class VLMClient:
         }
 
         # blocks until timeout or response
-        resp = httpx.post(self.url, json=payload, timeout=240)
+        resp = httpx.post(self.url, json=payload, timeout=self.timeout_sec)
         resp.raise_for_status()  # used to check if smt wrong, if yes, throw an error
 
         return resp.json()["choices"][0]["message"]["content"]

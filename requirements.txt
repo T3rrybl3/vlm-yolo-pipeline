@@ -7,6 +7,9 @@ pydantic>=2.3.0
 # Ultralytics YOLOv8
 ultralytics>=8.1.0
 
+# ByteTrack dependency used by ultralytics tracking
+lap>=0.5.12
+
 # OpenCV for image and video display
 opencv-python>=4.8.0.76
 
