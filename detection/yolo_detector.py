@@ -1,4 +1,5 @@
 from ultralytics import YOLO
+import torch
 
 
 class YOLODetector:
@@ -6,9 +7,12 @@ class YOLODetector:
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold  # boxes below this score get ignored
         self.tracker_config = tracker_config  # ByteTrack config used for persistent IDs
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if self.device != "cpu":
+            self.model.to(self.device)  # keep YOLO on GPU whenever CUDA is available
 
     def detect(self, image_path: str):
-        results = self.model(image_path, verbose=False)
+        results = self.model(image_path, device=self.device, verbose=False)
 
         detections = []
 
@@ -36,6 +40,7 @@ class YOLODetector:
                 tracker=self.tracker_config,
                 classes=[0],  # only track people so ByteTrack IDs map to human crops
                 conf=self.conf_threshold,
+                device=self.device,
                 persist=True,
                 verbose=False
             )

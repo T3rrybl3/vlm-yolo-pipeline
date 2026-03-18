@@ -1,7 +1,11 @@
 from io import BytesIO
 import os
+from queue import Full, Queue
+from threading import Lock, Thread
+import time
 
 import cv2
+import numpy as np
 from PIL import Image
 
 from detection.yolo_detector import YOLODetector
@@ -15,8 +19,13 @@ class PerceptionPipeline:
         self.video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg"}
         self.webcam_sources = {"webcam", "camera", "cam"}
         self.max_crop_side = int(os.getenv("VLM_MAX_CROP_SIDE", "896"))
+        self.vlm_queue_size = int(os.getenv("VLM_QUEUE_SIZE", "8"))
+        # 5 seconds is long enough to survive short occlusion/re-entry, but short enough to avoid stale rematches
+        self.rematch_timeout_sec = float(os.getenv("PERSON_REMATCH_TIMEOUT_SEC", "5"))
+        self.rematch_similarity_threshold = float(
+            os.getenv("PERSON_REMATCH_THRESHOLD", "0.82"))
 
-    def _crop_person_from_image(self, img: Image.Image, bbox: list[float]) -> bytes | None:
+    def _extract_crop_image(self, img: Image.Image, bbox: list[float]) -> Image.Image | None:
         x1, y1, x2, y2 = map(int, bbox)  # convert bbox floats to pixel ints
 
         pad = 10  # add padding so the person isn't cut off at the box edge
@@ -30,11 +39,12 @@ class PerceptionPipeline:
         if x2 <= x1 or y2 <= y1:
             return None  # skip invalid crops instead of sending junk to the VLM
 
-        crop = img.crop((x1, y1, x2, y2))
-        crop = self._resize_crop(crop)
+        return img.crop((x1, y1, x2, y2))
 
+    def _encode_crop_image(self, crop: Image.Image) -> bytes:
+        resized_crop = self._resize_crop(crop)
         buf = BytesIO()
-        crop.save(buf, format="JPEG")  # save to memory buffer instead of disk
+        resized_crop.save(buf, format="JPEG")  # save to memory buffer instead of disk
         return buf.getvalue()
 
     def _resize_crop(self, crop: Image.Image) -> Image.Image:
@@ -50,12 +60,51 @@ class PerceptionPipeline:
 
     def _crop_person(self, image_path: str, bbox: list[float]) -> bytes | None:
         with Image.open(image_path) as img:
-            return self._crop_person_from_image(img, bbox)
+            crop = self._extract_crop_image(img, bbox)
 
-    def _crop_person_from_frame(self, frame, bbox: list[float]) -> bytes | None:
+        if crop is None:
+            return None
+
+        return self._encode_crop_image(crop)
+
+    def _extract_crop_from_frame(self, frame, bbox: list[float]) -> Image.Image | None:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb_frame)
-        return self._crop_person_from_image(image, bbox)
+        return self._extract_crop_image(image, bbox)
+
+    def _crop_person_from_frame(self, frame, bbox: list[float]) -> bytes | None:
+        crop = self._extract_crop_from_frame(frame, bbox)
+
+        if crop is None:
+            return None
+
+        return self._encode_crop_image(crop)
+
+    def _compute_appearance_embedding(self, crop: Image.Image) -> np.ndarray:
+        # lightweight HSV histogram keeps rematching local and fast without another model dependency
+        resized = crop.convert("RGB").resize((96, 192), Image.Resampling.BILINEAR)
+        hsv = cv2.cvtColor(np.array(resized), cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+        return hist
+
+    def _appearance_similarity(self, left: np.ndarray | None, right: np.ndarray | None) -> float:
+        if left is None or right is None:
+            return -1.0
+
+        return float(np.dot(left, right))
+
+    def _blend_embeddings(self, current: np.ndarray | None, new: np.ndarray) -> np.ndarray:
+        if current is None:
+            return new
+
+        blended = (0.7 * current) + (0.3 * new)
+        norm = np.linalg.norm(blended)
+
+        if norm == 0:
+            return blended
+
+        return blended / norm
 
     def _is_video_source(self, source_path: str) -> bool:
         lowered = source_path.lower()
@@ -88,6 +137,157 @@ class PerceptionPipeline:
             )
 
         return annotated
+
+    def _new_identity(self, person_id: int, embedding: np.ndarray, current_time_sec: float):
+        return {
+            "id": person_id,
+            "embedding": embedding,
+            "description": None,
+            "last_seen": current_time_sec
+        }
+
+    def _prune_stale_identities(
+        self,
+        identities: dict[int, dict],
+        track_to_person: dict[int, int],
+        pending_ids: set[int],
+        current_time_sec: float
+    ):
+        expired_ids = []
+
+        for person_id, identity in identities.items():
+            if person_id in pending_ids:
+                continue  # keep identities alive until a queued VLM request finishes
+
+            if current_time_sec - identity["last_seen"] > self.rematch_timeout_sec:
+                expired_ids.append(person_id)
+
+        for person_id in expired_ids:
+            del identities[person_id]
+            print(
+                f"[Pipeline] Deleted Person {person_id} after {self.rematch_timeout_sec:.1f}s without a match.")
+
+        for track_id, person_id in list(track_to_person.items()):
+            if person_id not in identities:
+                del track_to_person[track_id]
+
+    def _resolve_person_id(
+        self,
+        track_id: int,
+        crop: Image.Image,
+        current_time_sec: float,
+        identities: dict[int, dict],
+        track_to_person: dict[int, int],
+        next_person_id: int,
+        reserved_person_ids: set[int]
+    ) -> tuple[int, int]:
+        embedding = self._compute_appearance_embedding(crop)
+
+        if track_id in track_to_person and track_to_person[track_id] in identities:
+            person_id = track_to_person[track_id]
+            identity = identities[person_id]
+            identity["embedding"] = self._blend_embeddings(
+                identity["embedding"], embedding)
+            identity["last_seen"] = current_time_sec
+            reserved_person_ids.add(person_id)
+            return person_id, next_person_id
+
+        best_person_id = None
+        best_score = -1.0
+
+        for person_id, identity in identities.items():
+            if person_id in reserved_person_ids:
+                continue  # do not let two tracks in one frame claim the same logical person
+
+            age_sec = current_time_sec - identity["last_seen"]
+            if age_sec > self.rematch_timeout_sec:
+                continue
+
+            score = self._appearance_similarity(identity["embedding"], embedding)
+            if score > best_score:
+                best_score = score
+                best_person_id = person_id
+
+        if best_person_id is not None and best_score >= self.rematch_similarity_threshold:
+            person_id = best_person_id
+            identity = identities[person_id]
+            identity["embedding"] = self._blend_embeddings(
+                identity["embedding"], embedding)
+            identity["last_seen"] = current_time_sec
+            track_to_person[track_id] = person_id
+            reserved_person_ids.add(person_id)
+            print(
+                f"[Pipeline] Re-matched ByteTrack ID {track_id} to Person {person_id} (similarity={best_score:.2f}).")
+            return person_id, next_person_id
+
+        person_id = next_person_id
+        identities[person_id] = self._new_identity(
+            person_id, embedding, current_time_sec)
+        track_to_person[track_id] = person_id
+        reserved_person_ids.add(person_id)
+        print(f"[Pipeline] Created Person {person_id} for ByteTrack ID {track_id}.")
+        return person_id, next_person_id + 1
+
+    def _build_person_payload(self, person_id: int, description: PersonDescription | None, is_pending: bool):
+        if description is not None:
+            return description.model_dump()
+
+        if is_pending:
+            return {
+                "id": person_id,
+                "action": "Analyzing...",
+                "attributes": "pending VLM result"
+            }
+
+        return {
+            "id": person_id,
+            "action": "Unknown",
+            "attributes": "no VLM result yet"
+        }
+
+    def _start_vlm_worker(self, identities: dict[int, dict], pending_ids: set[int], state_lock: Lock):
+        task_queue: Queue = Queue(maxsize=self.vlm_queue_size)
+        stop_token = object()
+
+        def worker():
+            while True:
+                task = task_queue.get()
+
+                if task is stop_token:
+                    task_queue.task_done()
+                    break
+
+                person_id = task["person_id"]
+                crop_bytes = task["crop_bytes"]
+
+                try:
+                    description = self.vlm.describe_person_crop(crop_bytes, person_id)
+
+                    with state_lock:
+                        if person_id in identities and description is not None:
+                            identities[person_id]["description"] = description
+                            print(
+                                f"[Pipeline] Person {person_id}: action={description.action}, attributes={description.attributes}")
+                        elif description is None:
+                            print(
+                                f"[Pipeline] Skipping Person {person_id} due to VLM parse failure.")
+
+                        pending_ids.discard(person_id)  # mark job finished whether it succeeded or not
+                finally:
+                    task_queue.task_done()
+
+        worker_thread = Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+        return task_queue, stop_token, worker_thread
+
+    def _stop_vlm_worker(self, task_queue: Queue, stop_token, worker_thread: Thread):
+        try:
+            task_queue.put(stop_token, timeout=1)  # ask the background worker to exit cleanly
+        except Full:
+            return
+
+        worker_thread.join(timeout=2)
 
     def _run_image(self, image_path: str):
         detections = self.detector.detect(image_path)
@@ -145,7 +345,9 @@ class PerceptionPipeline:
         fps = float(fps) if fps and fps > 0 else None
 
         frame_results = []
-        people_by_id: dict[int, PersonDescription] = {}
+        identities: dict[int, dict] = {}
+        track_to_person: dict[int, int] = {}
+        next_person_id = 1
         frame_index = 0
 
         self.detector.reset_tracker()  # start each video with a fresh ByteTrack state
@@ -157,45 +359,63 @@ class PerceptionPipeline:
                 if not ok:
                     break
 
+                current_time_sec = frame_index if fps is None else frame_index / fps
+                self._prune_stale_identities(
+                    identities, track_to_person, set(), current_time_sec)
+
                 detections = self.detector.track_people(frame)
                 people_in_frame = []
+                reserved_person_ids = set()
 
                 for det in detections:
-                    pid = det["id"]
+                    track_id = det["id"]
 
-                    if pid is None:
+                    if track_id is None:
                         continue  # tracker sometimes needs warmup before an ID is assigned
 
-                    description = people_by_id.get(pid)
+                    crop = self._extract_crop_from_frame(frame, det["bbox"])
+                    if crop is None:
+                        print(
+                            f"[Pipeline] Skipping ByteTrack ID {track_id} due to invalid crop.")
+                        continue
+
+                    person_id, next_person_id = self._resolve_person_id(
+                        track_id,
+                        crop,
+                        current_time_sec,
+                        identities,
+                        track_to_person,
+                        next_person_id,
+                        reserved_person_ids
+                    )
+
+                    identity = identities[person_id]
+                    description = identity["description"]
 
                     if description is None:
-                        print(f"Running VLM on Person {pid}...")
-                        crop_bytes = self._crop_person_from_frame(frame, det["bbox"])
-
-                        if crop_bytes is None:
-                            print(f"[Pipeline] Skipping Person {pid} due to invalid crop.")
-                            continue
-
-                        description = self.vlm.describe_person_crop(crop_bytes, pid)
+                        print(f"Running VLM on Person {person_id}...")
+                        crop_bytes = self._encode_crop_image(crop)
+                        description = self.vlm.describe_person_crop(
+                            crop_bytes, person_id)
 
                         if description is None:
                             print(
-                                f"[Pipeline] Skipping Person {pid} due to VLM parse failure.")
-                            continue
-
-                        people_by_id[pid] = description  # cache once per tracked person
+                                f"[Pipeline] Skipping Person {person_id} due to VLM parse failure.")
+                        else:
+                            identity["description"] = description
 
                     people_in_frame.append({
-                        "id": pid,
+                        "id": person_id,
                         "bbox": det["bbox"],
                         "confidence": det["confidence"],
                         "class": det["class"],
-                        "description": description.model_dump()
+                        "description": self._build_person_payload(
+                            person_id, identity["description"], False)
                     })
 
                 frame_results.append({
                     "frame_index": frame_index,
-                    "timestamp_sec": None if fps is None else frame_index / fps,
+                    "timestamp_sec": current_time_sec,
                     "people": people_in_frame
                 })
                 frame_index += 1
@@ -208,7 +428,8 @@ class PerceptionPipeline:
             "fps": fps,
             "total_frames": frame_index,
             "frames": frame_results,
-            "people": [people_by_id[pid].model_dump() for pid in sorted(people_by_id)]
+            "people": [identities[pid]["description"].model_dump() for pid in sorted(identities)
+                       if identities[pid]["description"] is not None]
         }
 
     def _run_webcam(self, camera_index: int = 0):
@@ -217,7 +438,13 @@ class PerceptionPipeline:
         if not cap.isOpened():
             raise ValueError(f"Could not open webcam index: {camera_index}")
 
-        people_by_id: dict[int, PersonDescription] = {}
+        identities: dict[int, dict] = {}
+        track_to_person: dict[int, int] = {}
+        pending_ids: set[int] = set()
+        state_lock = Lock()
+        next_person_id = 1
+        task_queue, stop_token, worker_thread = self._start_vlm_worker(
+            identities, pending_ids, state_lock)
         self.detector.reset_tracker()  # start each webcam session with a fresh ByteTrack state
 
         print("Webcam started. Press 'q' to quit.")
@@ -230,42 +457,73 @@ class PerceptionPipeline:
                     print("[Pipeline] Failed to read webcam frame, stopping.")
                     break
 
+                current_time_sec = time.monotonic()
+                with state_lock:
+                    self._prune_stale_identities(
+                        identities, track_to_person, pending_ids, current_time_sec)
+
                 detections = self.detector.track_people(frame)
                 people_in_frame = []
+                reserved_person_ids = set()
 
                 for det in detections:
-                    pid = det["id"]
+                    track_id = det["id"]
 
-                    if pid is None:
+                    if track_id is None:
                         continue  # tracker sometimes needs warmup before an ID is assigned
 
-                    description = people_by_id.get(pid)
-
-                    if description is None:
-                        print(f"Running VLM on Person {pid}...")
-                        crop_bytes = self._crop_person_from_frame(frame, det["bbox"])
-
-                        if crop_bytes is None:
-                            print(f"[Pipeline] Skipping Person {pid} due to invalid crop.")
-                            continue
-
-                        description = self.vlm.describe_person_crop(crop_bytes, pid)
-
-                        if description is None:
-                            print(
-                                f"[Pipeline] Skipping Person {pid} due to VLM parse failure.")
-                            continue
-
-                        people_by_id[pid] = description  # cache once per tracked person
+                    crop = self._extract_crop_from_frame(frame, det["bbox"])
+                    if crop is None:
                         print(
-                            f"[Pipeline] Person {pid}: action={description.action}, attributes={description.attributes}")
+                            f"[Pipeline] Skipping ByteTrack ID {track_id} due to invalid crop.")
+                        continue
+
+                    with state_lock:
+                        person_id, next_person_id = self._resolve_person_id(
+                            track_id,
+                            crop,
+                            current_time_sec,
+                            identities,
+                            track_to_person,
+                            next_person_id,
+                            reserved_person_ids
+                        )
+                        identity = identities[person_id]
+                        description = identity["description"]
+                        is_pending = person_id in pending_ids
+
+                    if description is None and not is_pending:
+                        print(f"Queueing VLM for Person {person_id}...")
+                        crop_bytes = self._encode_crop_image(crop)
+
+                        queued = False
+                        with state_lock:
+                            if identities[person_id]["description"] is None and person_id not in pending_ids:
+                                try:
+                                    task_queue.put_nowait({
+                                        "person_id": person_id,
+                                        "crop_bytes": crop_bytes
+                                    })
+                                    pending_ids.add(
+                                        person_id)  # prevent duplicate jobs while the worker is busy
+                                    queued = True
+                                except Full:
+                                    print(
+                                        f"[Pipeline] VLM queue is full, skipping Person {person_id} for now.")
+
+                        if queued:
+                            is_pending = True
+
+                    with state_lock:
+                        description = identities[person_id]["description"]
 
                     people_in_frame.append({
-                        "id": pid,
+                        "id": person_id,
                         "bbox": det["bbox"],
                         "confidence": det["confidence"],
                         "class": det["class"],
-                        "description": description.model_dump()
+                        "description": self._build_person_payload(
+                            person_id, description, is_pending)
                     })
 
                 annotated = self._annotate_frame(frame, people_in_frame)
@@ -275,13 +533,15 @@ class PerceptionPipeline:
                 if key == ord("q"):
                     break
         finally:
+            self._stop_vlm_worker(task_queue, stop_token, worker_thread)
             cap.release()
             cv2.destroyAllWindows()
             self.detector.reset_tracker()  # avoid leaking IDs into the next run
 
         return {
             "source": f"webcam:{camera_index}",
-            "people": [people_by_id[pid].model_dump() for pid in sorted(people_by_id)]
+            "people": [identities[pid]["description"].model_dump() for pid in sorted(identities)
+                       if identities[pid]["description"] is not None]
         }
 
     def run(self, source_path: str):
