@@ -21,9 +21,9 @@ class PerceptionPipeline:
         self.max_crop_side = int(os.getenv("VLM_MAX_CROP_SIDE", "896"))
         self.vlm_queue_size = int(os.getenv("VLM_QUEUE_SIZE", "8"))
         # 5 seconds is long enough to survive short occlusion/re-entry, but short enough to avoid stale rematches
-        self.rematch_timeout_sec = float(os.getenv("PERSON_REMATCH_TIMEOUT_SEC", "5"))
+        self.rematch_timeout_sec = float(os.getenv("PERSON_REMATCH_TIMEOUT_SEC", "20"))
         self.rematch_similarity_threshold = float(
-            os.getenv("PERSON_REMATCH_THRESHOLD", "0.82"))
+            os.getenv("PERSON_REMATCH_THRESHOLD", "0.5"))
 
     def _extract_crop_image(self, img: Image.Image, bbox: list[float]) -> Image.Image | None:
         x1, y1, x2, y2 = map(int, bbox)  # convert bbox floats to pixel ints
@@ -80,13 +80,61 @@ class PerceptionPipeline:
 
         return self._encode_crop_image(crop)
 
+    def _normalize_feature_vector(self, feature: np.ndarray) -> np.ndarray:
+        feature = feature.astype(np.float32).flatten()
+        norm = np.linalg.norm(feature)
+
+        if norm == 0:
+            return feature
+
+        return feature / norm
+
     def _compute_appearance_embedding(self, crop: Image.Image) -> np.ndarray:
-        # lightweight HSV histogram keeps rematching local and fast without another model dependency
+        # use a mix of color and texture so rematching is less brittle than hsv alone
         resized = crop.convert("RGB").resize((96, 192), Image.Resampling.BILINEAR)
-        hsv = cv2.cvtColor(np.array(resized), cv2.COLOR_RGB2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        return hist
+        rgb = np.array(resized)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+        # keep some color information, but split the crop so upper and lower clothing matter separately
+        upper_hsv = hsv[: hsv.shape[0] // 2, :, :]
+        lower_hsv = hsv[hsv.shape[0] // 2:, :, :]
+        upper_hist = cv2.calcHist([upper_hsv], [0, 1], None, [12, 8], [0, 180, 0, 256])
+        lower_hist = cv2.calcHist([lower_hsv], [0, 1], None, [12, 8], [0, 180, 0, 256])
+        upper_hist = self._normalize_feature_vector(upper_hist)
+        lower_hist = self._normalize_feature_vector(lower_hist)
+
+        # add coarse rgb statistics so overall brightness and channel balance are represented
+        rgb_mean = rgb.mean(axis=(0, 1)).astype(np.float32) / 255.0
+        rgb_std = rgb.std(axis=(0, 1)).astype(np.float32) / 255.0
+
+        # add gradient orientation features so body outline and clothing texture help rematching
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude, angle = cv2.cartToPolar(grad_x, grad_y, angleInDegrees=True)
+        orientation_hist, _ = np.histogram(
+            angle,
+            bins=16,
+            range=(0.0, 360.0),
+            weights=magnitude
+        )
+        orientation_hist = self._normalize_feature_vector(orientation_hist)
+
+        # include simple shape cues so a very different crop is less likely to steal an id
+        aspect_ratio = np.array(
+            [rgb.shape[1] / max(rgb.shape[0], 1)],
+            dtype=np.float32
+        )
+
+        feature = np.concatenate([
+            upper_hist,
+            lower_hist,
+            rgb_mean,
+            rgb_std,
+            orientation_hist,
+            aspect_ratio,
+        ]).astype(np.float32)
+        return self._normalize_feature_vector(feature)
 
     def _appearance_similarity(self, left: np.ndarray | None, right: np.ndarray | None) -> float:
         if left is None or right is None:
@@ -120,17 +168,32 @@ class PerceptionPipeline:
             x1, y1, x2, y2 = map(int, person["bbox"])
             pid = person["id"]
             action = person["description"]["action"]
-
+            attributes = person["description"]["attributes"]
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
             # keep overlay short so it stays readable in the webcam window
-            label = f"ID {pid}: {action}"
+            label1 = f"ID {pid}: {action}"
+            label2 = f"Attributes: {attributes}"
+
+            # First line
             cv2.putText(
                 annotated,
-                label,
+                label1,
                 (x1, max(25, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+            # Second line (shifted down)
+            cv2.putText(
+                annotated,
+                label2,
+                (x1, max(25, y1 - 10) + 25),  # adjust spacing here
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA
@@ -220,6 +283,13 @@ class PerceptionPipeline:
                 f"[Pipeline] Re-matched ByteTrack ID {track_id} to Person {person_id} (similarity={best_score:.2f}).")
             return person_id, next_person_id
 
+        # for testing remove later: show why an eligible old identity was not reused
+        if best_person_id is not None:
+            print(
+                f"[Pipeline] ByteTrack ID {track_id} did not rematch. "
+                f"Best candidate was Person {best_person_id} with similarity={best_score:.2f} "
+                f"below threshold={self.rematch_similarity_threshold:.2f}.")
+
         person_id = next_person_id
         identities[person_id] = self._new_identity(
             person_id, embedding, current_time_sec)
@@ -236,7 +306,7 @@ class PerceptionPipeline:
             return {
                 "id": person_id,
                 "action": "Analyzing...",
-                "attributes": "pending VLM result"
+                "attributes": "pending..."
             }
 
         return {

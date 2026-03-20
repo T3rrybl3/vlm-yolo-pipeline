@@ -18,7 +18,7 @@ class PeopleDescription(BaseModel):
 class VLMClient:
     def __init__(self, model=None):
         # 3B fits much better on a 6GB GPU, 7B was falling back to CPU on this machine
-        self.model = model or os.getenv("VLM_MODEL", "qwen2.5vl:3b")
+        self.model = model or os.getenv("VLM_MODEL", "llava:7b")
         self.url = os.getenv("VLM_URL", "http://localhost:11434/v1/chat/completions")
         self.timeout_sec = int(os.getenv("VLM_TIMEOUT_SEC", "120"))
 
@@ -50,9 +50,26 @@ class VLMClient:
             "stream": False
         }
 
-        # blocks until timeout or response
-        resp = httpx.post(self.url, json=payload, timeout=self.timeout_sec)
-        resp.raise_for_status()  # used to check if smt wrong, if yes, throw an error
+        try:
+            # blocks until timeout or response
+            resp = httpx.post(self.url, json=payload, timeout=self.timeout_sec)
+            resp.raise_for_status()  # used to check if smt wrong, if yes, throw an error
+        except httpx.HTTPStatusError as e:
+            message = None
+            try:
+                body = e.response.json()
+                message = body.get("error", {}).get("message")
+            except Exception:
+                message = e.response.text.strip() or None
+
+            status = e.response.status_code
+            detail = f"HTTP {status}"
+            if message:
+                detail = f"{detail}: {message}"
+
+            raise RuntimeError(
+                f"VLM request failed for model '{self.model}' at '{self.url}' ({detail})"
+            ) from e
 
         return resp.json()["choices"][0]["message"]["content"]
 
@@ -89,7 +106,7 @@ No extra text, no markdown, no explanation."""
             return PersonDescription(**data)  # validate types before returning
         except Exception as e:
             print(
-                f"[VLM] Failed to parse response for Person {person_id}: {e}")
+                f"[VLM] Failed to describe Person {person_id}: {e}")
             return None  # return None so pipeline can skip this person cleanly
 
     # shared parser for full-image responses
